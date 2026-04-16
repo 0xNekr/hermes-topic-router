@@ -1,0 +1,20 @@
+{
+  "routes": [
+    {
+      "platform": "telegram",
+      "chat_id": "-100XXXXXXXXXX",
+      "thread_id": "5",
+      "model": "kimi-k2.5",
+      "label": "Kimi K2.5"
+    },
+    {
+      "platform": "telegram",
+      "chat_id": "-100XXXXXXXXXX",
+      "thread_id": "12",
+      "model": "qwen3.6-plus",
+      "label": "Qwen 3.6+"
+    }
+  ],
+  "default_model": null,
+  "log_routing": true
+}
