@@ -5,6 +5,7 @@
       "chat_id": "-100XXXXXXXXXX",
       "thread_id": "5",
       "model": "kimi-k2.5",
+      "provider": "opencode-go",
       "label": "Kimi K2.5"
     },
     {
@@ -12,6 +13,7 @@
       "chat_id": "-100XXXXXXXXXX",
       "thread_id": "12",
       "model": "qwen3.6-plus",
+      "provider": "opencode-go",
       "label": "Qwen 3.6+"
     }
   ],

@@ -27,6 +27,7 @@ class Route:
     chat_id: str
     thread_id: str
     model: str
+    provider: str = ""
     label: str = ""
 
 
@@ -68,6 +69,7 @@ def _parse_route(raw: dict) -> Route | None:
             chat_id=str(raw["chat_id"]),
             thread_id=str(raw["thread_id"]),
             model=str(raw["model"]),
+            provider=str(raw.get("provider", "")),
             label=str(raw.get("label", "")),
         )
     except (KeyError, TypeError) as e:
@@ -112,6 +114,79 @@ def load_config() -> RouterConfig:
         config_path,
     )
     return config
+
+
+def _get_or_create_config_path() -> Path:
+    """Get the config file path, creating it if needed."""
+    env_path = os.environ.get("TOPIC_ROUTER_CONFIG")
+    if env_path:
+        return Path(env_path)
+    return _SEARCH_PATHS[0]
+
+
+def save_config(config: RouterConfig) -> None:
+    """Write the current config to disk."""
+    config_path = config._config_path or _get_or_create_config_path()
+
+    data = {
+        "routes": [
+            {
+                "platform": r.platform,
+                "chat_id": r.chat_id,
+                "thread_id": r.thread_id,
+                "model": r.model,
+                "provider": r.provider,
+                "label": r.label,
+            }
+            for r in config.routes
+        ],
+        "default_model": config.default_model,
+        "log_routing": config.log_routing,
+    }
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    config._config_path = config_path
+    config._last_mtime = config_path.stat().st_mtime
+
+    logger.info("topic-router: saved %d route(s) to %s", len(config.routes), config_path)
+
+
+def add_route(config: RouterConfig, route: Route) -> RouterConfig:
+    """Add or update a route. Returns a new config."""
+    # Remove existing route for same platform/chat/thread
+    filtered = [
+        r for r in config.routes
+        if not (r.platform == route.platform and r.chat_id == route.chat_id and r.thread_id == route.thread_id)
+    ]
+    filtered.append(route)
+
+    new_config = RouterConfig(
+        routes=filtered,
+        default_model=config.default_model,
+        log_routing=config.log_routing,
+    )
+    new_config._config_path = config._config_path
+    new_config._last_mtime = config._last_mtime
+    return new_config
+
+
+def remove_route(config: RouterConfig, platform: str, chat_id: str, thread_id: str) -> RouterConfig:
+    """Remove a route. Returns a new config."""
+    filtered = [
+        r for r in config.routes
+        if not (r.platform == platform and r.chat_id == chat_id and r.thread_id == thread_id)
+    ]
+
+    new_config = RouterConfig(
+        routes=filtered,
+        default_model=config.default_model,
+        log_routing=config.log_routing,
+    )
+    new_config._config_path = config._config_path
+    new_config._last_mtime = config._last_mtime
+    return new_config
 
 
 def maybe_reload(config: RouterConfig) -> RouterConfig:

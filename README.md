@@ -12,23 +12,23 @@ Hermes Agent doesn't support per-topic model overrides ([#4431](https://github.c
 
 ## The Solution
 
-This plugin intercepts API requests via Hermes' `pre_api_request` hook and automatically swaps the model based on which topic the message came from.
+This plugin hooks into `pre_llm_call` to swap the model (and optionally the provider) before each LLM call, based on which topic the message came from. It also injects context so the LLM knows which model it's running as.
 
 ```
-Telegram topic "Kimi K2.5" (thread_id=5)
-  -> Gateway sets HERMES_SESSION_THREAD_ID=5
-  -> Agent processes message
-  -> pre_api_request hook fires
-  -> Plugin reads thread_id -> looks up config -> model = kimi-k2.5
-  -> Mutates request body with correct model
-  -> API request goes out with the right model
+Telegram topic "Kimi K2.5" (thread_id=325)
+  -> pre_llm_call fires
+  -> Plugin reads HERMES_SESSION_KEY -> extracts thread_id
+  -> Looks up config -> target model = kimi-k2.5
+  -> Swaps agent.model (same provider) or agent.switch_model() (cross-provider)
+  -> Injects "[You are running as kimi-k2.5]" into context
+  -> LLM responds as kimi-k2.5
 ```
 
-No extra bots needed. No manual `/model` switching. Just configure once.
+No extra bots needed. No manual `/model` switching. Configure once, works forever.
 
 ## Installation
 
-### Method 1: Hermes CLI (recommended)
+### Method 1: Hermes CLI
 
 ```bash
 hermes plugins install 0xNekr/hermes-topic-router
@@ -41,27 +41,22 @@ git clone https://github.com/0xNekr/hermes-topic-router.git \
   ~/.hermes/plugins/topic-router
 ```
 
-## Configuration
+## Quick start
 
-### 1. Find your topic thread IDs
-
-Open each forum topic in **Telegram Web** or **Desktop**. The URL looks like:
+After installing, go to any Telegram forum topic and say:
 
 ```
-https://t.me/c/1234567890/5
-                          ^-- this is the thread_id
+Route this topic to kimi-k2.5
 ```
 
-For the **chat_id**, you can use `/chatid` bots or check the gateway logs -- Hermes logs the chat_id on incoming messages.
+The plugin registers tools (`topic_route_set`, `topic_route_remove`, `topic_route_list`) that the LLM can call to manage routes. You can also edit `config.json` manually.
 
-### 2. Create your config
+## Manual configuration
 
 ```bash
 cp ~/.hermes/plugins/topic-router/config.example.json \
    ~/.hermes/plugins/topic-router/config.json
 ```
-
-Edit `config.json`:
 
 ```json
 {
@@ -69,15 +64,17 @@ Edit `config.json`:
     {
       "platform": "telegram",
       "chat_id": "-1001234567890",
-      "thread_id": "5",
+      "thread_id": "325",
       "model": "kimi-k2.5",
+      "provider": "opencode-go",
       "label": "Kimi K2.5"
     },
     {
       "platform": "telegram",
       "chat_id": "-1001234567890",
-      "thread_id": "12",
+      "thread_id": "412",
       "model": "qwen3.6-plus",
+      "provider": "opencode-go",
       "label": "Qwen 3.6+"
     }
   ],
@@ -86,6 +83,17 @@ Edit `config.json`:
 }
 ```
 
+### Finding your IDs
+
+Open a topic in **Telegram Web**, the URL looks like:
+
+```
+https://t.me/c/1234567890/325
+                           ^-- thread_id
+```
+
+For the **chat_id**, check the gateway logs or use a `/chatid` bot.
+
 ### Config fields
 
 | Field | Type | Description |
@@ -93,8 +101,9 @@ Edit `config.json`:
 | `routes[].platform` | string | `"telegram"`, `"discord"`, `"slack"`, etc. |
 | `routes[].chat_id` | string | Group/channel ID. Use `"*"` for wildcard. |
 | `routes[].thread_id` | string | Topic/thread ID. Use `"*"` for wildcard. |
-| `routes[].model` | string | Model name (same format as `hermes config` / `/model`) |
-| `routes[].label` | string | (Optional) Human-readable label for `/routes` display |
+| `routes[].model` | string | Model name (same format as `/model`) |
+| `routes[].provider` | string | (Optional) Provider name for cross-provider routing |
+| `routes[].label` | string | (Optional) Human-readable label |
 | `default_model` | string\|null | Fallback model when no route matches |
 | `log_routing` | bool | Log model switches (default: `true`) |
 
@@ -103,28 +112,26 @@ Edit `config.json`:
 1. **Exact match**: platform + chat_id + thread_id
 2. **Chat wildcard**: platform + chat_id + thread_id=`"*"`
 3. **Platform wildcard**: platform + chat_id=`"*"` + thread_id=`"*"`
-4. **Default model**: `default_model` from config
+4. **Default model** from config
 5. **No override**: Hermes uses its configured model
-
-### Environment variable
-
-You can override the config path:
-
-```bash
-export TOPIC_ROUTER_CONFIG=/path/to/my/config.json
-```
-
-## Usage
-
-Once installed and configured, the plugin works transparently. Send a message in any mapped topic and the model is automatically swapped.
-
-### Check active routes
-
-Type `/routes` in any Hermes chat to see the current routing table.
 
 ### Hot reload
 
-Edit `config.json` while the gateway is running -- changes are picked up automatically on the next message (no restart needed).
+Edit `config.json` while the gateway is running. Changes are picked up on the next message.
+
+## How it works
+
+The plugin uses two mechanisms depending on the routing scenario:
+
+**Same provider** (e.g. both models on OpenCode Go):
+- Directly sets `agent.model` to the target model name
+- No client rebuild needed, instant swap
+
+**Cross-provider** (e.g. OpenAI Codex -> OpenCode Go):
+- Calls `hermes_cli.model_switch.switch_model()` to resolve credentials
+- Then calls `agent.switch_model()` to rebuild the client with the new provider
+
+Both paths are triggered from the `pre_llm_call` hook via frame inspection to access the AIAgent instance. The plugin also injects context so the LLM correctly identifies itself.
 
 ## Platform support
 
@@ -136,23 +143,14 @@ Edit `config.json` while the gateway is running -- changes are picked up automat
 | CLI | Safe no-op | - | - |
 | DMs / non-threaded groups | Safe no-op | - | - |
 
-> The plugin relies on `HERMES_SESSION_THREAD_ID` which the gateway sets for all threaded platforms. When no thread_id is present, the plugin does nothing and won't interfere with non-threaded conversations.
-
-## How it works
-
-The plugin registers a `pre_api_request` hook that fires before every LLM API call. It reads `HERMES_SESSION_THREAD_ID` and `HERMES_SESSION_CHAT_ID` from environment variables (set by the Hermes gateway), looks up the matching route, and mutates the request body's `model` field in-place.
-
-This works because:
-- Python dicts are mutable and passed by reference
-- All models share the same provider (same API key, same base URL)
-- Only the model name in the request body needs to change
+> The plugin reads `HERMES_SESSION_KEY` to detect the platform and thread. When no thread is present, the plugin does nothing and won't interfere.
 
 ## Limitations
 
-- **Undocumented behavior**: The `pre_api_request` body mutation is not officially documented by Hermes. If a future version deep-copies the body before passing it to hooks, this plugin will stop working. Tested with Hermes Agent v0.9.x.
-- **Concurrent message race condition**: Hermes uses `os.environ` for session context ([#7358](https://github.com/NousResearch/hermes-agent/issues/7358)). Under heavy concurrent load, two messages processed simultaneously might read each other's thread_id. Low risk for small groups.
-- **Same provider only**: All routed models must be accessible through the same provider (e.g. all on OpenCode Go, or all on OpenRouter). Cross-provider routing is not supported.
-- **Telegram-tested only**: Discord and Slack should work (same `HERMES_SESSION_THREAD_ID` mechanism) but have not been tested yet. Reports welcome!
+- **Frame inspection**: The plugin walks the call stack to find the AIAgent instance. This works on Hermes v0.9.x but could break if Hermes restructures its agent loop.
+- **Concurrent message race condition**: `HERMES_SESSION_KEY` is set via `os.environ` ([#7358](https://github.com/NousResearch/hermes-agent/issues/7358)). Low risk for small groups.
+- **`/model` display**: The `/new` and `/model` commands show the default model, not the routed model. The actual routing is correct.
+- **Telegram-tested only**: Discord and Slack should work (same `HERMES_SESSION_KEY` mechanism) but have not been tested. Reports welcome!
 
 ## Development
 

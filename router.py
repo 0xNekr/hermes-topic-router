@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from config import RouterConfig
+try:
+    from .config import RouterConfig
+except ImportError:
+    from config import RouterConfig
 
 
 def get_model_for_topic(

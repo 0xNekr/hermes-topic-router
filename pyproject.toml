@@ -1,7 +1,7 @@
 [project]
 name = "hermes-topic-router"
-version = "0.1.0"
-description = "Auto-route LLM models per chat topic/thread - one bot, multiple models"
+version = "0.2.0"
+description = "Auto-route LLM models per chat topic/thread, one bot, multiple models"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
