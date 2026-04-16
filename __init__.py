@@ -280,23 +280,31 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
 
     try:
         current_provider = getattr(agent, "provider", "") or ""
-        from hermes_cli.model_switch import switch_model as resolve_switch
-        result = resolve_switch(
-            raw_input=target_model,
-            current_provider=current_provider,
-            current_model=model,
-            current_base_url=getattr(agent, "base_url", "") or "",
-            current_api_key=getattr(agent, "api_key", "") or "",
-            explicit_provider=target_provider or current_provider,
-        )
-        agent.switch_model(
-            new_model=result.new_model,
-            new_provider=result.target_provider,
-            api_key=result.api_key,
-            base_url=result.base_url,
-            api_mode=getattr(result, "api_mode", ""),
-        )
-        logger.info("topic-router: %s -> %s (provider: %s)", model, result.new_model, result.target_provider)
+        same_provider = (not target_provider) or (target_provider == current_provider)
+
+        if same_provider:
+            # Same provider: just swap model name, keep api_mode/base_url/credentials
+            agent.model = target_model
+            logger.info("topic-router: %s -> %s (same provider: %s)", model, target_model, current_provider)
+        else:
+            # Cross-provider: full credential + api_mode resolution
+            from hermes_cli.model_switch import switch_model as resolve_switch
+            result = resolve_switch(
+                raw_input=target_model,
+                current_provider=current_provider,
+                current_model=model,
+                current_base_url=getattr(agent, "base_url", "") or "",
+                current_api_key=getattr(agent, "api_key", "") or "",
+                explicit_provider=target_provider,
+            )
+            agent.switch_model(
+                new_model=result.new_model,
+                new_provider=result.target_provider,
+                api_key=result.api_key,
+                base_url=result.base_url,
+                api_mode=getattr(result, "api_mode", ""),
+            )
+            logger.info("topic-router: %s -> %s (provider: %s -> %s)", model, result.new_model, current_provider, result.target_provider)
     except Exception as exc:
         logger.warning("topic-router: switch failed: %s", exc)
         return
