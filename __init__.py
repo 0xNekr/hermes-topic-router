@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import urllib.request
 
 try:
     from .config import Route, RouterConfig, add_route, load_config, maybe_reload, remove_route, save_config
@@ -18,7 +19,7 @@ except ImportError:
     from config import Route, RouterConfig, add_route, load_config, maybe_reload, remove_route, save_config
     from router import format_route_table, get_model_for_topic
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +27,14 @@ logger = logging.getLogger(__name__)
 _config: RouterConfig = RouterConfig()
 _session_ctx: dict = {"platform": "", "chat_id": "", "thread_id": ""}
 
+# Pending selections: "chat_id:thread_id" -> {"step": "provider"} or {"step": "model", "provider": "..."}
+_pending_selections: dict[str, dict] = {}
+
 _KNOWN_PLATFORMS = {"telegram", "discord", "slack", "whatsapp", "signal"}
 
 
 def _read_session_context(platform_hint: str = "") -> tuple[str, str, str]:
-    """Read session context from HERMES_SESSION_KEY and cache it for tools.
-
-    HERMES_SESSION_KEY format: "agent:main:telegram:group:-1003957589238:325"
-    """
+    """Read session context from HERMES_SESSION_KEY and cache it for tools."""
     session_key = os.environ.get("HERMES_SESSION_KEY", "")
 
     if session_key:
@@ -52,11 +53,7 @@ def _read_session_context(platform_hint: str = "") -> tuple[str, str, str]:
     if platform_hint and not _session_ctx["platform"]:
         _session_ctx["platform"] = platform_hint
 
-    return (
-        _session_ctx["platform"],
-        _session_ctx["chat_id"],
-        _session_ctx["thread_id"],
-    )
+    return _session_ctx["platform"], _session_ctx["chat_id"], _session_ctx["thread_id"]
 
 
 def _find_agent_from_stack():
@@ -70,9 +67,96 @@ def _find_agent_from_stack():
     return None
 
 
+def _get_providers_and_models() -> dict[str, dict]:
+    """Fetch available providers and their models from Hermes internals + config."""
+    result = {}
+    try:
+        from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS
+        for slug, models in _PROVIDER_MODELS.items():
+            if not models or slug in ("custom", "copilot-acp"):
+                continue
+            label = _PROVIDER_LABELS.get(slug, slug)
+            result[slug] = {"label": label, "models": list(models)}
+    except Exception:
+        pass
+
+    # Merge available_models from config (supplements incomplete Hermes lists)
+    if _config.available_models:
+        provider = _config.default_provider or "custom"
+        if provider not in result:
+            result[provider] = {"label": provider, "models": []}
+        existing = set(m.lower() for m in result[provider]["models"])
+        for m in _config.available_models:
+            if m.lower() not in existing:
+                result[provider]["models"].append(m)
+
+    return result
+
+
+def _send_telegram_keyboard(chat_id: str, thread_id: str, buttons: list[list[str]], text: str) -> bool:
+    """Send a reply keyboard via Telegram Bot API."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token or not buttons:
+        return False
+
+    keyboard = [[{"text": b} for b in row] for row in buttons]
+    keyboard.append([{"text": "cancel"}])
+
+    payload = json.dumps({
+        "chat_id": int(chat_id),
+        "message_thread_id": int(thread_id),
+        "text": text,
+        "reply_markup": {
+            "keyboard": keyboard,
+            "one_time_keyboard": True,
+            "selective": True,
+            "resize_keyboard": True,
+        },
+    })
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        req = urllib.request.Request(url, data=payload.encode(), headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception as exc:
+        logger.warning("topic-router: telegram keyboard failed: %s", exc)
+        return False
+
+
+def _remove_telegram_keyboard(chat_id: str, thread_id: str, text: str) -> bool:
+    """Remove the reply keyboard."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        return False
+
+    payload = json.dumps({
+        "chat_id": int(chat_id),
+        "message_thread_id": int(thread_id),
+        "text": text,
+        "reply_markup": {"remove_keyboard": True, "selective": True},
+    })
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        req = urllib.request.Request(url, data=payload.encode(), headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _strip_username_prefix(msg: str) -> str:
+    """Strip [Username] prefix added by Hermes gateway."""
+    msg = msg.strip()
+    if msg.startswith("[") and "] " in msg:
+        msg = msg.split("] ", 1)[1]
+    return msg.strip().lower()
+
+
 def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: list,
                      is_first_turn: bool, model: str, platform: str, **kwargs):
-    """Switch model for routed topics and inject model identity context."""
+    """Switch model for routed topics OR handle keyboard selection flow."""
     global _config
     _config = maybe_reload(_config)
     _read_session_context(platform_hint=platform)
@@ -81,6 +165,74 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
     chat_id = _session_ctx["chat_id"]
     thread_id = _session_ctx["thread_id"]
 
+    # -- Handle pending keyboard selection --
+    pending_key = f"{chat_id}:{thread_id}"
+    pending = _pending_selections.get(pending_key)
+
+    if pending:
+        msg = _strip_username_prefix(user_message or "")
+
+        if msg == "cancel":
+            _pending_selections.pop(pending_key, None)
+            _remove_telegram_keyboard(chat_id, thread_id, "Selection cancelled.")
+            return {"context": "[System: Model selection cancelled.]"}
+
+        if pending["step"] == "provider":
+            # User picked a provider -> show models
+            providers = _get_providers_and_models()
+            # Strip trailing "(N)" count from button text
+            import re
+            clean_msg = re.sub(r"\s*\(\d+\)\s*$", "", msg).strip()
+            # Match by label or slug
+            matched_slug = None
+            for slug, info in providers.items():
+                if clean_msg == slug.lower() or clean_msg == info["label"].lower():
+                    matched_slug = slug
+                    break
+
+            if matched_slug:
+                models = providers[matched_slug]["models"]
+                # Build model keyboard: 2 per row, strip provider prefix
+                display_models = [m.split("/")[-1] if "/" in m else m for m in models]
+                rows = [display_models[i:i + 2] for i in range(0, len(display_models), 2)]
+                _pending_selections[pending_key] = {"step": "model", "provider": matched_slug, "models": dict(zip(display_models, models))}
+                _send_telegram_keyboard(chat_id, thread_id, rows, f"Select a model ({providers[matched_slug]['label']}):")
+                return {"context": "[System: User is picking a model from the keyboard. Wait for their selection.]"}
+
+        elif pending["step"] == "model":
+            # User picked a model
+            provider = pending["provider"]
+            models_map = pending.get("models", {})
+            # Match exact or by display name
+            full_model = models_map.get(msg) or msg
+
+            if msg in models_map or msg in [m.lower() for m in models_map]:
+                # Find the correct key
+                for display, full in models_map.items():
+                    if display.lower() == msg:
+                        full_model = full
+                        break
+
+                _pending_selections.pop(pending_key, None)
+
+                # Save route with display name (without provider/ prefix)
+                model_name = full_model.split("/")[-1] if "/" in full_model else full_model
+                route = Route(
+                    platform=platform_ctx.lower(),
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    model=model_name,
+                    provider=provider,
+                    label="",
+                )
+                _config = add_route(_config, route)
+                save_config(_config)
+
+                _remove_telegram_keyboard(chat_id, thread_id, f"Routed to {model_name} ({provider}).")
+                logger.info("topic-router: route set via keyboard: %s:%s -> %s (%s)", chat_id, thread_id, model_name, provider)
+                return {"context": f"[System: Route saved: {model_name} via {provider}. Confirm to the user.]"}
+
+    # -- Normal routing: swap model if topic has a route --
     target_model = get_model_for_topic(_config, platform_ctx, chat_id, thread_id) if thread_id else None
 
     if not target_model or target_model == model:
@@ -137,25 +289,16 @@ def _on_session_start(session_id: str, model: str, platform: str, **kwargs) -> N
     _read_session_context(platform_hint=platform)
 
 
-SCHEMA_ROUTE_SET = {
+# -- Tools --
+
+SCHEMA_ROUTE_SELECT = {
     "type": "object",
     "description": (
-        "Assign a specific LLM model to the current chat topic/thread. "
-        "You MUST extract the model name from the user's message and pass it as the 'model' parameter. "
-        "Example: if user says 'route this topic to kimi-k2.5', call this tool with model='kimi-k2.5'. "
-        "The topic context (platform, chat_id, thread_id) is auto-detected."
+        "Open the model selector for the current topic. Shows a two-step keyboard: "
+        "first pick a provider, then pick a model. No parameters needed. "
+        "Call this when the user asks to route/assign/set/change a model for this topic."
     ),
-    "properties": {
-        "model": {
-            "type": "string",
-            "description": (
-                "The exact model name to assign. Extract this from the user's message. "
-                "Examples: 'kimi-k2.5', 'qwen3.6-plus', 'glm-5.1', 'mimo-v2-pro'. "
-                "This parameter is REQUIRED, do not call this tool without it."
-            ),
-        },
-    },
-    "required": ["model"],
+    "properties": {},
 }
 
 SCHEMA_ROUTE_REMOVE = {
@@ -171,38 +314,44 @@ SCHEMA_ROUTE_LIST = {
 }
 
 
-def _tool_route_set(args: dict, **kwargs) -> str:
-    """Set model route for the current topic."""
+def _tool_route_select(args: dict, **kwargs) -> str:
+    """Show provider selector keyboard."""
     global _config
     _config = maybe_reload(_config)
 
     platform, chat_id, thread_id = _read_session_context()
-    model_name = args.get("model", "")
 
     if not platform or not thread_id:
-        return json.dumps({"error": "No topic detected. This only works inside a threaded chat."})
+        return json.dumps({"error": "No topic detected. Only works inside a threaded chat."})
 
-    if not model_name:
-        return json.dumps({"error": "Model name is required."})
+    if platform != "telegram":
+        return json.dumps({"error": f"Keyboard selector only works on Telegram (current: {platform})."})
 
-    route = Route(
-        platform=platform.lower(),
-        chat_id=chat_id,
-        thread_id=thread_id,
-        model=model_name,
-        label="",
-    )
-    _config = add_route(_config, route)
-    save_config(_config)
+    providers = _get_providers_and_models()
+    if not providers:
+        return json.dumps({"error": "Could not load provider list from Hermes."})
 
-    return json.dumps({
-        "success": True,
-        "message": f"Route saved: this topic -> {model_name}",
-        "platform": platform,
-        "chat_id": chat_id,
-        "thread_id": thread_id,
-        "model": model_name,
-    })
+    # Build provider keyboard: 2 per row, show label + model count
+    rows = []
+    row = []
+    for slug, info in providers.items():
+        label = f"{info['label']} ({len(info['models'])})"
+        row.append(label)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    pending_key = f"{chat_id}:{thread_id}"
+    _pending_selections[pending_key] = {"step": "provider"}
+
+    sent = _send_telegram_keyboard(chat_id, thread_id, rows, "Select a provider:")
+    if not sent:
+        _pending_selections.pop(pending_key, None)
+        return json.dumps({"error": "Failed to send keyboard. Check TELEGRAM_BOT_TOKEN."})
+
+    return json.dumps({"success": True, "message": "Provider selector sent. Waiting for user to pick."})
 
 
 def _tool_route_remove(args: dict, **kwargs) -> str:
@@ -213,7 +362,7 @@ def _tool_route_remove(args: dict, **kwargs) -> str:
     platform, chat_id, thread_id = _read_session_context()
 
     if not platform or not thread_id:
-        return json.dumps({"error": "No topic detected. This only works inside a threaded chat."})
+        return json.dumps({"error": "No topic detected."})
 
     current = get_model_for_topic(_config, platform, chat_id, thread_id)
     if current is None:
@@ -222,10 +371,7 @@ def _tool_route_remove(args: dict, **kwargs) -> str:
     _config = remove_route(_config, platform.lower(), chat_id, thread_id)
     save_config(_config)
 
-    return json.dumps({
-        "success": True,
-        "message": f"Route removed (was {current}).",
-    })
+    return json.dumps({"success": True, "message": f"Route removed (was {current})."})
 
 
 def _tool_route_list(args: dict, **kwargs) -> str:
@@ -249,7 +395,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
-    ctx.register_tool(name="topic_route_set", toolset="topic-router", schema=SCHEMA_ROUTE_SET, handler=_tool_route_set)
+    ctx.register_tool(name="topic_route_select", toolset="topic-router", schema=SCHEMA_ROUTE_SELECT, handler=_tool_route_select)
     ctx.register_tool(name="topic_route_remove", toolset="topic-router", schema=SCHEMA_ROUTE_REMOVE, handler=_tool_route_remove)
     ctx.register_tool(name="topic_route_list", toolset="topic-router", schema=SCHEMA_ROUTE_LIST, handler=_tool_route_list)
 

@@ -37,6 +37,8 @@ class RouterConfig:
 
     routes: list[Route] = field(default_factory=list)
     default_model: str | None = None
+    default_provider: str = ""
+    available_models: list[str] = field(default_factory=list)
     log_routing: bool = True
 
     # Internal: track file for hot-reload
@@ -103,6 +105,8 @@ def load_config() -> RouterConfig:
     config = RouterConfig(
         routes=routes,
         default_model=raw.get("default_model"),
+        default_provider=raw.get("default_provider", ""),
+        available_models=[str(m) for m in raw.get("available_models", [])],
         log_routing=raw.get("log_routing", True),
     )
     config._config_path = config_path
@@ -141,6 +145,8 @@ def save_config(config: RouterConfig) -> None:
             for r in config.routes
         ],
         "default_model": config.default_model,
+        "default_provider": config.default_provider,
+        "available_models": config.available_models,
         "log_routing": config.log_routing,
     }
 
@@ -165,6 +171,8 @@ def add_route(config: RouterConfig, route: Route) -> RouterConfig:
     new_config = RouterConfig(
         routes=filtered,
         default_model=config.default_model,
+        default_provider=config.default_provider,
+        available_models=config.available_models,
         log_routing=config.log_routing,
     )
     new_config._config_path = config._config_path
@@ -182,6 +190,8 @@ def remove_route(config: RouterConfig, platform: str, chat_id: str, thread_id: s
     new_config = RouterConfig(
         routes=filtered,
         default_model=config.default_model,
+        default_provider=config.default_provider,
+        available_models=config.available_models,
         log_routing=config.log_routing,
     )
     new_config._config_path = config._config_path

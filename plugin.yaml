@@ -1,5 +1,5 @@
 name: topic-router
-version: 0.2.0
+version: 0.3.0
 description: Auto-route LLM models per chat topic/thread, one bot, multiple models
 author: 0xNekr
 

@@ -46,10 +46,16 @@ git clone https://github.com/0xNekr/hermes-topic-router.git \
 After installing, go to any Telegram forum topic and say:
 
 ```
-Route this topic to kimi-k2.5
+Route this topic
 ```
 
-The plugin registers tools (`topic_route_set`, `topic_route_remove`, `topic_route_list`) that the LLM can call to manage routes. You can also edit `config.json` manually.
+A two-step keyboard appears:
+1. **Pick a provider** (OpenAI Codex, OpenCode Go, Anthropic, etc.)
+2. **Pick a model** from that provider
+
+The route is saved automatically. All future messages in this topic use the selected model.
+
+The provider/model list is pulled dynamically from Hermes internals. You can supplement it with `available_models` in config.json for models Hermes doesn't list yet.
 
 ## Manual configuration
 
@@ -105,6 +111,8 @@ For the **chat_id**, check the gateway logs or use a `/chatid` bot.
 | `routes[].provider` | string | (Optional) Provider name for cross-provider routing |
 | `routes[].label` | string | (Optional) Human-readable label |
 | `default_model` | string\|null | Fallback model when no route matches |
+| `default_provider` | string | Default provider for routes created via Telegram selector |
+| `available_models` | string[] | Extra models to add to the selector (supplements Hermes list) |
 | `log_routing` | bool | Log model switches (default: `true`) |
 
 ### Route resolution order

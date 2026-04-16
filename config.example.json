@@ -1,22 +1,17 @@
 {
-  "routes": [
-    {
-      "platform": "telegram",
-      "chat_id": "-100XXXXXXXXXX",
-      "thread_id": "5",
-      "model": "kimi-k2.5",
-      "provider": "opencode-go",
-      "label": "Kimi K2.5"
-    },
-    {
-      "platform": "telegram",
-      "chat_id": "-100XXXXXXXXXX",
-      "thread_id": "12",
-      "model": "qwen3.6-plus",
-      "provider": "opencode-go",
-      "label": "Qwen 3.6+"
-    }
-  ],
+  "routes": [],
   "default_model": null,
+  "default_provider": "opencode-go",
+  "available_models": [
+    "kimi-k2.5",
+    "qwen3.6-plus",
+    "qwen3.5-plus",
+    "glm-5.1",
+    "glm-5",
+    "mimo-v2-omni",
+    "mimo-v2-pro",
+    "minimax-m2.5",
+    "minimax-m2.7"
+  ],
   "log_routing": true
 }
