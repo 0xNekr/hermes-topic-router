@@ -27,10 +27,39 @@ logger = logging.getLogger(__name__)
 _config: RouterConfig = RouterConfig()
 _session_ctx: dict = {"platform": "", "chat_id": "", "thread_id": ""}
 
-# Pending selections: "chat_id:thread_id" -> {"step": "provider"} or {"step": "model", "provider": "..."}
-_pending_selections: dict[str, dict] = {}
-
 _KNOWN_PLATFORMS = {"telegram", "discord", "slack", "whatsapp", "signal"}
+
+# Persist pending selections to survive gateway restarts
+_PENDING_FILE = os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "plugins", "topic-router", ".pending.json")
+
+
+def _load_pending() -> dict[str, dict]:
+    try:
+        with open(_PENDING_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pending(pending: dict[str, dict]) -> None:
+    try:
+        os.makedirs(os.path.dirname(_PENDING_FILE), exist_ok=True)
+        with open(_PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(pending, f)
+    except OSError:
+        pass
+
+
+def _clear_pending(key: str) -> None:
+    pending = _load_pending()
+    pending.pop(key, None)
+    _save_pending(pending)
+
+
+def _set_pending(key: str, state: dict) -> None:
+    pending = _load_pending()
+    pending[key] = state
+    _save_pending(pending)
 
 
 def _read_session_context(platform_hint: str = "") -> tuple[str, str, str]:
@@ -167,13 +196,13 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
 
     # -- Handle pending keyboard selection --
     pending_key = f"{chat_id}:{thread_id}"
-    pending = _pending_selections.get(pending_key)
+    pending = _load_pending().get(pending_key)
 
     if pending:
         msg = _strip_username_prefix(user_message or "")
 
         if msg == "cancel":
-            _pending_selections.pop(pending_key, None)
+            _clear_pending(pending_key)
             _remove_telegram_keyboard(chat_id, thread_id, "Selection cancelled.")
             return {"context": "[System: Model selection cancelled.]"}
 
@@ -195,7 +224,7 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
                 # Build model keyboard: 2 per row, strip provider prefix
                 display_models = [m.split("/")[-1] if "/" in m else m for m in models]
                 rows = [display_models[i:i + 2] for i in range(0, len(display_models), 2)]
-                _pending_selections[pending_key] = {"step": "model", "provider": matched_slug, "models": dict(zip(display_models, models))}
+                _set_pending(pending_key, {"step": "model", "provider": matched_slug, "models": dict(zip(display_models, models))})
                 _send_telegram_keyboard(chat_id, thread_id, rows, f"Select a model ({providers[matched_slug]['label']}):")
                 return {"context": "[System: User is picking a model from the keyboard. Wait for their selection.]"}
 
@@ -213,7 +242,7 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
                         full_model = full
                         break
 
-                _pending_selections.pop(pending_key, None)
+                _clear_pending(pending_key)
 
                 # Save route with display name (without provider/ prefix)
                 model_name = full_model.split("/")[-1] if "/" in full_model else full_model
@@ -251,29 +280,23 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
 
     try:
         current_provider = getattr(agent, "provider", "") or ""
-        same_provider = (not target_provider) or (target_provider == current_provider)
-
-        if same_provider:
-            agent.model = target_model
-            logger.info("topic-router: %s -> %s (same provider: %s)", model, target_model, current_provider)
-        else:
-            from hermes_cli.model_switch import switch_model as resolve_switch
-            result = resolve_switch(
-                raw_input=target_model,
-                current_provider=current_provider,
-                current_model=model,
-                current_base_url=getattr(agent, "base_url", "") or "",
-                current_api_key=getattr(agent, "api_key", "") or "",
-                explicit_provider=target_provider,
-            )
-            agent.switch_model(
-                new_model=result.new_model,
-                new_provider=result.target_provider,
-                api_key=result.api_key,
-                base_url=result.base_url,
-                api_mode=getattr(result, "api_mode", ""),
-            )
-            logger.info("topic-router: %s -> %s (provider: %s -> %s)", model, result.new_model, current_provider, result.target_provider)
+        from hermes_cli.model_switch import switch_model as resolve_switch
+        result = resolve_switch(
+            raw_input=target_model,
+            current_provider=current_provider,
+            current_model=model,
+            current_base_url=getattr(agent, "base_url", "") or "",
+            current_api_key=getattr(agent, "api_key", "") or "",
+            explicit_provider=target_provider or current_provider,
+        )
+        agent.switch_model(
+            new_model=result.new_model,
+            new_provider=result.target_provider,
+            api_key=result.api_key,
+            base_url=result.base_url,
+            api_mode=getattr(result, "api_mode", ""),
+        )
+        logger.info("topic-router: %s -> %s (provider: %s)", model, result.new_model, result.target_provider)
     except Exception as exc:
         logger.warning("topic-router: switch failed: %s", exc)
         return
@@ -344,11 +367,11 @@ def _tool_route_select(args: dict, **kwargs) -> str:
         rows.append(row)
 
     pending_key = f"{chat_id}:{thread_id}"
-    _pending_selections[pending_key] = {"step": "provider"}
+    _set_pending(pending_key, {"step": "provider"})
 
     sent = _send_telegram_keyboard(chat_id, thread_id, rows, "Select a provider:")
     if not sent:
-        _pending_selections.pop(pending_key, None)
+        _clear_pending(pending_key)
         return json.dumps({"error": "Failed to send keyboard. Check TELEGRAM_BOT_TOKEN."})
 
     return json.dumps({"success": True, "message": "Provider selector sent. Waiting for user to pick."})
