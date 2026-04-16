@@ -297,12 +297,19 @@ def _on_pre_llm_call(session_id: str, user_message: str, conversation_history: l
                 current_api_key=getattr(agent, "api_key", "") or "",
                 explicit_provider=target_provider,
             )
+            # Aggregators serve all models via chat_completions regardless of
+            # what Hermes resolves (avoids minimax 404 on OpenCode Go)
+            _AGGREGATOR_PROVIDERS = {"opencode-go", "opencode-zen", "openrouter", "ai-gateway"}
+            resolved_api_mode = getattr(result, "api_mode", "")
+            if result.target_provider in _AGGREGATOR_PROVIDERS:
+                resolved_api_mode = "chat_completions"
+
             agent.switch_model(
                 new_model=result.new_model,
                 new_provider=result.target_provider,
                 api_key=result.api_key,
                 base_url=result.base_url,
-                api_mode=getattr(result, "api_mode", ""),
+                api_mode=resolved_api_mode,
             )
             logger.info("topic-router: %s -> %s (provider: %s -> %s)", model, result.new_model, current_provider, result.target_provider)
     except Exception as exc:
